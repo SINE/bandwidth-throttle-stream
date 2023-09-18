@@ -97,6 +97,11 @@ class BandwidthThrottleGroup {
         while (this.bandwidthThrottles.length)
             this.bandwidthThrottles.pop()!.destroy();
     }
+    public emergencyAbort(throttle: BandwidthThrottle): void {
+        clearInterval(this.pollThroughputIntervalId);
+        
+        this.bandwidthThrottles[this.bandwidthThrottles.indexOf(throttle)].abort();
+    }
 
     /**
      * Increments the number of "in-flight" requests when a request in any
@@ -177,84 +182,92 @@ class BandwidthThrottleGroup {
      */
 
     private processInFlightRequests(): void {
-        // Check the time since data was last processed
+        try {
+            // Check the time since data was last processed
 
-        const now = Date.now();
-        const elapsedTime = this.hasTicked ? now - this.lastTickTime : 0;
+            const now = Date.now();
+            const elapsedTime = this.hasTicked ? now - this.lastTickTime : 0;
 
-        // If throttling active and not the first tick and
-        // the time elapsed is less than the provided interval
-        // duration, do nothing.
+            // If throttling active and not the first tick and
+            // the time elapsed is less than the provided interval
+            // duration, do nothing.
 
-        if (
-            this.config.isThrottled &&
-            this.hasTicked &&
-            elapsedTime < this.config.tickDurationMs
-        )
-            return;
+            if (
+                this.config.isThrottled &&
+                this.hasTicked &&
+                elapsedTime < this.config.tickDurationMs
+            )
+                return;
 
-        // If we have not achieved our `tickDurationMs` goal, then create a multiplier
-        // to augment the amount of data sent for the tick, proportional to the delay
+            // If we have not achieved our `tickDurationMs` goal, then create a multiplier
+            // to augment the amount of data sent for the tick, proportional to the delay
 
-        const delayMultiplier = Math.max(
-            1,
-            elapsedTime / this.config.tickDurationMs
-        );
-        const period = this.secondIndex % this.inFlightRequests.length;
-
-        for (let i = 0; i < this.inFlightRequests.length; i++) {
-            // Step 1 - evenly destribute bytes between active requests. If cannot
-            // be evenly divided, use per second rotation to balance
-            // Step 2 - for each individual request, distribute over resolution
-
-            const currentInFlightRequestsCount = this.inFlightRequests.length;
-            const bandwidthThrottle = this.inFlightRequests[i];
-
-            const rotatedIndex = (i + period) % currentInFlightRequestsCount;
-
-            const bytesPerRequestPerSecond = getPartitionedIntegerPartAtIndex(
-                this.config.bytesPerSecond,
-                this.inFlightRequests.length,
-                rotatedIndex
+            const delayMultiplier = Math.max(
+                1,
+                elapsedTime / this.config.tickDurationMs
             );
+            const period = this.secondIndex % this.inFlightRequests.length;
 
-            const bytesPerRequestPerTick = getPartitionedIntegerPartAtIndex(
-                bytesPerRequestPerSecond,
-                this.config.ticksPerSecond,
-                this.tickIndex
-            );
+            for (let i = 0; i < this.inFlightRequests.length; i++) {
+                // Step 1 - evenly destribute bytes between active requests. If cannot
+                // be evenly divided, use per second rotation to balance
+                // Step 2 - for each individual request, distribute over resolution
 
-            const bytesProcessed = bandwidthThrottle.process(
-                bytesPerRequestPerTick * delayMultiplier
-            );
+                const currentInFlightRequestsCount = this.inFlightRequests.length;
+                const bandwidthThrottle = this.inFlightRequests[i];
+                if(!bandwidthThrottle.readable.locked || !bandwidthThrottle.writable.locked){
+                    this.emergencyAbort(this.inFlightRequests[i]);
+                    continue;
+                }
 
-            this.totalBytesProcessed += bytesProcessed;
+                const rotatedIndex = (i + period) % currentInFlightRequestsCount;
 
-            if (this.inFlightRequests.length < currentInFlightRequestsCount) {
-                i--;
+                const bytesPerRequestPerSecond = getPartitionedIntegerPartAtIndex(
+                    this.config.bytesPerSecond,
+                    this.inFlightRequests.length,
+                    rotatedIndex
+                );
+
+                const bytesPerRequestPerTick = getPartitionedIntegerPartAtIndex(
+                    bytesPerRequestPerSecond,
+                    this.config.ticksPerSecond,
+                    this.tickIndex
+                );
+
+                const bytesProcessed = bandwidthThrottle.process(
+                    bytesPerRequestPerTick * delayMultiplier
+                );
+
+                this.totalBytesProcessed += bytesProcessed;
+
+                if (this.inFlightRequests.length < currentInFlightRequestsCount) {
+                    i--;
+                }
             }
+        
+            // If the clock has been stopped because a call to `.process()`
+            // completed the last active request, then do not update state.
+
+            if (!this.isTicking) return;
+
+            this.tickIndex++;
+
+            // Increment the tick index, or reset it to 0 whenever it surpasses
+            // the desired resolution
+
+            if (this.tickIndex === this.config.ticksPerSecond) {
+                this.tickIndex = 0;
+                this.secondIndex++;
+            }
+
+            // Increment the last push time, and return
+
+            this.lastTickTime = this.hasTicked
+                ? this.lastTickTime + elapsedTime
+                : now;
+        }  catch (e) {
+           console.error(e);
         }
-
-        // If the clock has been stopped because a call to `.process()`
-        // completed the last active request, then do not update state.
-
-        if (!this.isTicking) return;
-
-        this.tickIndex++;
-
-        // Increment the tick index, or reset it to 0 whenever it surpasses
-        // the desired resolution
-
-        if (this.tickIndex === this.config.ticksPerSecond) {
-            this.tickIndex = 0;
-            this.secondIndex++;
-        }
-
-        // Increment the last push time, and return
-
-        this.lastTickTime = this.hasTicked
-            ? this.lastTickTime + elapsedTime
-            : now;
     }
 
     private pollThroughput(): Timeout {
