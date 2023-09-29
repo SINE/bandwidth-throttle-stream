@@ -97,10 +97,9 @@ class BandwidthThrottleGroup {
         while (this.bandwidthThrottles.length)
             this.bandwidthThrottles.pop()!.destroy();
     }
-    public emergencyAbort(throttle: BandwidthThrottle): void {
-        clearInterval(this.pollThroughputIntervalId);
-        
-        this.bandwidthThrottles[this.bandwidthThrottles.indexOf(throttle)].abort();
+
+    public getThisThrottleIndex(throttle: BandwidthThrottle): number {
+        return this.bandwidthThrottles.indexOf(throttle);
     }
 
     /**
@@ -128,12 +127,20 @@ class BandwidthThrottleGroup {
      */
 
     private handleRequestStop(bandwidthThrottle: BandwidthThrottle): void {
+        console.log("handleRequestStop, inFlightRequests:",this.inFlightRequests.length)
+        console.log("handleRequestStop, bandwidthThrottles:",this.bandwidthThrottles.length)
         this.inFlightRequests.splice(
             this.inFlightRequests.indexOf(bandwidthThrottle),
             1
         );
-
-        if (this.inFlightRequests.length === 0) this.stopClock();
+        if( this.inFlightRequests.length === 1 ) {
+            console.log("handleRequestStop, inFlightRequests.length === 1.")
+            console.log("handleRequestStop, inFlightRequests:",this.inFlightRequests)
+        }
+        if (this.inFlightRequests.length === 0) {
+            console.log("handleRequestStop, inFlightRequests.length === 0. Stopping Clock.")
+            this.stopClock();
+        }
     }
 
     /**
@@ -208,42 +215,35 @@ class BandwidthThrottleGroup {
             );
             const period = this.secondIndex % this.inFlightRequests.length;
 
-            for (let i = 0; i < this.inFlightRequests.length; i++) {
+            this.inFlightRequests.forEach((bandwidthThrottle,i,inFlightRequestsArray) => {
                 // Step 1 - evenly destribute bytes between active requests. If cannot
                 // be evenly divided, use per second rotation to balance
                 // Step 2 - for each individual request, distribute over resolution
 
-                const currentInFlightRequestsCount = this.inFlightRequests.length;
-                const bandwidthThrottle = this.inFlightRequests[i];
                 if(!bandwidthThrottle.readable.locked || !bandwidthThrottle.writable.locked){
-                    this.emergencyAbort(this.inFlightRequests[i]);
-                    continue;
+                    //this.emergencyAbort(this.inFlightRequests[i]);
+                    console.log("graceful abort")
+                    bandwidthThrottle.gracefulAbort();
+                    return;
                 }
+                    const rotatedIndex = (i + period) % inFlightRequestsArray.length;
 
-                const rotatedIndex = (i + period) % currentInFlightRequestsCount;
-
-                const bytesPerRequestPerSecond = getPartitionedIntegerPartAtIndex(
-                    this.config.bytesPerSecond,
-                    this.inFlightRequests.length,
-                    rotatedIndex
-                );
-
-                const bytesPerRequestPerTick = getPartitionedIntegerPartAtIndex(
-                    bytesPerRequestPerSecond,
-                    this.config.ticksPerSecond,
-                    this.tickIndex
-                );
-
-                const bytesProcessed = bandwidthThrottle.process(
-                    bytesPerRequestPerTick * delayMultiplier
-                );
-
+                    const bytesPerRequestPerSecond = getPartitionedIntegerPartAtIndex(
+                        this.config.bytesPerSecond,
+                        inFlightRequestsArray.length,
+                        rotatedIndex
+                    );
+                    const bytesPerRequestPerTick = getPartitionedIntegerPartAtIndex(
+                        bytesPerRequestPerSecond,
+                        this.config.ticksPerSecond,
+                        this.tickIndex
+                    );
+                    
+                    const bytesProcessed = bandwidthThrottle.process(
+                        bytesPerRequestPerTick * delayMultiplier
+                    );
                 this.totalBytesProcessed += bytesProcessed;
-
-                if (this.inFlightRequests.length < currentInFlightRequestsCount) {
-                    i--;
-                }
-            }
+            });
         
             // If the clock has been stopped because a call to `.process()`
             // completed the last active request, then do not update state.
@@ -266,6 +266,7 @@ class BandwidthThrottleGroup {
                 ? this.lastTickTime + elapsedTime
                 : now;
         }  catch (e) {
+            console.log("***** error in processInFlightRequests")
            console.error(e);
         }
     }

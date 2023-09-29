@@ -14,7 +14,9 @@ import IConfig from './Interfaces/IConfig.ts';
  * @param options An optional object of configuration options for the group.
  */
 
-const createBandwidthThrottleGroup = (options: IConfig = {}) =>
-    new BandwidthThrottleGroup(options);
+const createBandwidthThrottleGroup = (options: IConfig = {}) => {
+    console.log("create BandwidthThrottleGroup");
+    return new BandwidthThrottleGroup(options);
+}
 
 export default createBandwidthThrottleGroup;

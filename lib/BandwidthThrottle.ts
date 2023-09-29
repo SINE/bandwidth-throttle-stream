@@ -79,7 +79,10 @@ class BandwidthThrottle extends BaseTransformStream {
         this.config = config;
         this.pendingBytesBuffer = new Uint8Array(contentLength);
         this.handleRequestStart = handleRequestStart;
-        this.handleRequestStop = handleRequestEnd;
+        this.handleRequestStop = () => {
+            //console.log("handleRequestStop called from BandwidthThrottle.ts")
+            return handleRequestEnd(this);
+        };
         this.handleRequestDestroy = handleRequestDestroy;
     }
 
@@ -100,7 +103,7 @@ class BandwidthThrottle extends BaseTransformStream {
      * @returns The number of bytes processed through the throttle
      */
 
-    public process(maxBytesToProcess: number = Infinity): number {
+    public process(maxBytesToProcess: number = Infinity,shortprocess?:boolean): number {
         const startReadIndex = this.pendingBytesReadIndex;
 
         const endReadIndex = Math.min(
@@ -145,6 +148,17 @@ class BandwidthThrottle extends BaseTransformStream {
         this.destroy();
 
         return bytesToPushLength;
+    }
+
+    /**
+     * To be called when the request being throttled is aborted in
+     * order to rebalance the available bandwidth. Resolves a promise
+     */
+
+    public gracefulAbort(): void {
+        this.done.resolve()
+        this.handleRequestStop(this);
+        this.destroy();
     }
 
     /**
