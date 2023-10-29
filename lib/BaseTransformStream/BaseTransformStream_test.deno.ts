@@ -17,18 +17,6 @@ class BaseTransformStream extends TransformStream<Uint8Array, Uint8Array> {
         });
     }
 
-    protected push(chunk: Uint8Array,backpressure_resolver?:Function): void {
-        this.controller!.enqueue(chunk);
-        if( backpressure_resolver ) {
-            backpressure_resolver();
-        }
-        else
-            console.log("no backpressure resolver!")
-    }
-
-    protected destroy(): void {
-        this.controller?.terminate();
-    }
 }
 
 export default BaseTransformStream;

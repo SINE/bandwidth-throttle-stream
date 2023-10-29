@@ -1,4 +1,5 @@
 import BandwidthThrottle from './BandwidthThrottle.ts';
+import BandwidthThrottleWithBackpressure from './BandwidthThrottleWithBackpressure.ts';
 import Config from './Config.ts';
 import IConfig from './Interfaces/IConfig.ts';
 import IThroughputData from './Interfaces/IThroughputData.ts';
@@ -29,7 +30,7 @@ class BandwidthThrottleGroup {
         | null = null;
 
     private inFlightRequests: BandwidthThrottle[] = [];
-    private bandwidthThrottles: BandwidthThrottle[] = [];
+    private bandwidthThrottles: (BandwidthThrottle|BandwidthThrottleWithBackpressure)[] = [];
     private clockIntervalId: Timeout | null = null;
     private pollThroughputIntervalId: Timeout = this.pollThroughput();
     private lastTickTime: number = -1;
@@ -71,14 +72,25 @@ class BandwidthThrottleGroup {
      * @param contentLength The total number of bytes for the request to be throttled.
      */
 
-    public createBandwidthThrottle(contentLength: number): BandwidthThrottle {
-        const bandwidthThrottle = new BandwidthThrottle(
-            this.config,
-            contentLength,
-            this.handleRequestStart,
-            this.handleRequestStop,
-            this.handleRequestDestroy
-        );
+    public createBandwidthThrottle(contentLength: number,backpressure?:boolean): BandwidthThrottle|BandwidthThrottleWithBackpressure {
+        let bandwidthThrottle;
+        if( backpressure ) {
+            bandwidthThrottle = new BandwidthThrottleWithBackpressure(
+                this.config,
+                contentLength,
+                this.handleRequestStart,
+                this.handleRequestStop,
+                this.handleRequestDestroy
+            );
+        } else {
+            bandwidthThrottle = new BandwidthThrottle(
+                this.config,
+                contentLength,
+                this.handleRequestStart,
+                this.handleRequestStop,
+                this.handleRequestDestroy
+            );
+        }
 
         this.bandwidthThrottles.push(bandwidthThrottle);
 
@@ -129,6 +141,13 @@ class BandwidthThrottleGroup {
     private handleRequestStop(bandwidthThrottle: BandwidthThrottle): void {
         console.log("handleRequestStop, inFlightRequests:",this.inFlightRequests.length)
         console.log("handleRequestStop, bandwidthThrottles:",this.bandwidthThrottles.length)
+
+        if( bandwidthThrottle.pendingBytesBuffer ) {
+            console.log("handleRequestStop, bandwidthThrottle.pendingBytesBuffer is not null, releasing memory");
+            bandwidthThrottle.pendingBytesBuffer = null;
+        } else
+            console.log("handleRequestStop, bandwidthThrottle.pendingBytesBuffer is null or inaccessible");
+        
         this.inFlightRequests.splice(
             this.inFlightRequests.indexOf(bandwidthThrottle),
             1
@@ -148,6 +167,13 @@ class BandwidthThrottleGroup {
      */
 
     private handleRequestDestroy(bandwidthThrottle: BandwidthThrottle): void {
+        if( bandwidthThrottle.pendingBytesBuffer ) {
+            console.log("handleRequestDestroy, bandwidthThrottle.pendingBytesBuffer is not null, releasing memory");
+            bandwidthThrottle.pendingBytesBuffer = null;
+        } else {
+            console.log("handleRequestDestroy, bandwidthThrottle.pendingBytesBuffer is null or inaccessible");
+        }
+        
         this.bandwidthThrottles.splice(
             this.bandwidthThrottles.indexOf(bandwidthThrottle),
             1

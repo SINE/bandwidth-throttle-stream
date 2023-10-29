@@ -1,5 +1,5 @@
+import { resolve } from "https://deno.land/std@0.200.0/path/resolve.ts";
 import Config from './Config.ts';
-import {BaseTransformStream} from './Platform/mod.ts';
 import CallbackWithSelf from './Types/CallbackWithSelf.ts';
 import deferred from './Util/deferred.ts';
 
@@ -25,7 +25,11 @@ const ClampNum = (number:number, min:number, max:number) => {
  * the group, mimicing the behaviour of overlapping network requests.
  */
 
-class BandwidthThrottle extends BaseTransformStream {
+class BandwidthThrottleWithBackpressure extends TransformStream<any, any> {
+    private controller: TransformStreamDefaultController<
+    Uint8Array
+> | null = null;
+    
     /**
      * A callback to be invoked when bytes are written
      * to the underlying `readable` stream. Used as a hook
@@ -46,6 +50,8 @@ class BandwidthThrottle extends BaseTransformStream {
     private handleRequestDestroy: CallbackWithSelf;
     private done = deferred<void>();
     private chunkCounter: number = 0;
+    public resolver_backpressure: Function | undefined = undefined;
+    
 
     constructor(
         /**
@@ -86,12 +92,20 @@ class BandwidthThrottle extends BaseTransformStream {
         handleRequestDestroy: CallbackWithSelf,
     ) {
         super({
-            transform: (chunk: Uint8Array) => {
-                console.log("BandwidthThrottle.ts: transform called");
+            transform: (chunk: Uint8Array,controller:TransformStreamDefaultController) => {
+                this.controller = controller;
+                console.log("BandwidthThrottleWithBackpressure.ts: transform called");
                 this.chunkCounter+=1;
-                console.log("BandwidthThrottle.ts: chunkCounter: ",this.chunkCounter);
-                return new Promise((resolve) => {
-                    //this.transform(chunk);
+               // console.log("BandwidthThrottle.ts: chunkCounter: ",this.chunkCounter);
+               
+                return new Promise((resolver_backpressure,rejecter_backpressure) => {
+                    this.resolver_backpressure = resolver_backpressure;
+                    console.log("BandwidthThrottleWithBackpressure.ts: transform promise function called. chunk#",this.chunkCounter);
+                    if(this.chunkCounter <= 1000) {
+                        setTimeout(() => {
+                            this.transform(chunk);
+                        }, 1000);
+                    }
                 });
             },
             flush: () => this.flush()
@@ -106,6 +120,7 @@ class BandwidthThrottle extends BaseTransformStream {
             return handleRequestEnd(this);
         };
         this.handleRequestDestroy = handleRequestDestroy;
+        this.resolver_backpressure = undefined;
     }
 
     /**
@@ -118,16 +133,25 @@ class BandwidthThrottle extends BaseTransformStream {
         this.destroy();
     }
 
+    protected push(chunk: Uint8Array,backpressure_resolver?:Function): void {
+        this.controller!.enqueue(chunk);
+        if( backpressure_resolver ) {
+            backpressure_resolver();
+        }
+        else
+            console.log("no backpressure resolver!")
+    }
+
     public trim_buffer = ():Promise<unknown> => {
         return new Promise((resolve) => {
             console.log("trim_buffer called");
-            const transferBufferLength = ClampNum(this.pendingBytesCount - this.pendingBytesReadIndex,0,this.config.maxBufferSize);
-            const transferredBuffer = this.pendingBytesBuffer.subarray(this.pendingBytesReadIndex,this.pendingBytesCount)
-            this.pendingBytesBuffer = null;
+            console.log("before trim_buffer: pending Bytes Count: ",this.pendingBytesCount);
+            console.log("before trim_buffer: pending Bytes Read Index: ",this.pendingBytesReadIndex);
+            const transferredBuffer = this.pendingBytesBuffer?.subarray(this.pendingBytesReadIndex,this.pendingBytesCount)??new Uint8Array();
             this.pendingBytesBuffer = new Uint8Array(this.pendingBytesBufferExpandedSize);
-            this.pendingBytesBuffer.set(transferredBuffer??[],0);
+            this.pendingBytesBuffer.set(transferredBuffer);
             this.pendingBytesReadIndex = 0;
-            this.pendingBytesCount = transferBufferLength;
+            this.pendingBytesCount = transferredBuffer.length;
             console.log("after trim_buffer: pending Bytes Count: ",this.pendingBytesCount);
             console.log("after trim_buffer: pending Bytes Read Index: ",this.pendingBytesReadIndex);
             resolve(true);
@@ -141,16 +165,12 @@ class BandwidthThrottle extends BaseTransformStream {
      * @returns The number of bytes processed through the throttle
      */
 
-    public async process(maxBytesToProcess: number = Infinity,shortprocess?:boolean): number {
-        if(maxBytesToProcess !== Infinity )
-            console.log("process called from tick");
-        
+    public async process(maxBytesToProcess: number|undefined = Infinity): number {
+        //console.log("process call: maxBytesToProcess: ",maxBytesToProcess, "this.pendingBytesCount: ",this.pendingBytesCount);
         const startReadIndex = this.pendingBytesReadIndex;
 
-        this.pendingBytesBuffer?.slice(0, startReadIndex);
-
         const endReadIndex = Math.min(
-            this.pendingBytesReadIndex + maxBytesToProcess,
+            this.pendingBytesReadIndex +  Math.round(maxBytesToProcess),
             this.pendingBytesCount
         );
 
@@ -164,10 +184,11 @@ class BandwidthThrottle extends BaseTransformStream {
 
             this.pendingBytesReadIndex = endReadIndex;
 
-            this.push(bytesToPush);
-
-            console.log("process call: calling trim_buffer");
+            console.log("calling trim from process")
             await this.trim_buffer();
+            const formerresolver = this.resolver_backpressure;
+            this.resolver_backpressure = undefined;
+            this.push(bytesToPush,formerresolver);
 
             if (typeof this.onBytesWritten === 'function') {
                 this.onBytesWritten(bytesToPush);
@@ -197,6 +218,44 @@ class BandwidthThrottle extends BaseTransformStream {
     }
 
     /**
+         * To be called when a properly throttled write stream is needed.
+         * The write stream will call the throttle's transform method
+         * and wait for the promise to resolve before processing the next chunk.
+         * @returns WritableStream<any>
+    */
+
+    public throttleInputValve = (): WritableStream<any> => {
+        let WriteStreamChunkNumber = 0;
+        const ThrottledStreamWriter = this.writable.getWriter();
+
+        const WriteStream = new WritableStream ({
+            write(chunk,controller) {
+                return new Promise(async (resolve_write,reject_write) => {
+                    console.log("writing chunk #",WriteStreamChunkNumber);
+                    WriteStreamChunkNumber+=1;
+                    const thisChunkNumber = WriteStreamChunkNumber;
+
+                    const returnedpromise = await ThrottledStreamWriter.write(chunk);
+                    console.log("returnedpromise:",returnedpromise)
+                    console.log("chunk #",thisChunkNumber,"written. resolving write.")
+                    //resolve_write();
+                    reject_write();
+                });
+            },
+            abort(controller) {
+                WriteStream.abort();
+            }
+        },{
+            highWaterMark: 64,
+            size(chunk) {
+                return chunk.length;
+            }
+        });
+
+        return WriteStream;
+    }
+
+    /**
      * To be called when the request being throttled is aborted in
      * order to rebalance the available bandwidth. Resolves a promise
      */
@@ -214,8 +273,7 @@ class BandwidthThrottle extends BaseTransformStream {
 
     public destroy(): void {
         this.handleRequestDestroy(this);
-
-        super.destroy();
+        this.controller?.terminate();
     }
 
     /**
@@ -239,7 +297,7 @@ class BandwidthThrottle extends BaseTransformStream {
         if((chunk.length + this.pendingBytesCount) > this.pendingBytesBufferExpandedSize){
             const remainingContentInBufferLength = (this.pendingBytesCount - this.pendingBytesReadIndex);
             if(chunk.length + remainingContentInBufferLength <= this.config.maxBufferSize) {
-                if(this.pendingBytesBufferExpandedSize < this.config.maxBufferSize) {
+                if( remainingContentInBufferLength + chunk.length > this.pendingBytesBufferExpandedSize) {
                     console.log("bufferlengthcheck: maxbuffer not reached, first if");
                     this.pendingBytesBufferExpandedFactor = Math.ceil((chunk.length + remainingContentInBufferLength)/this.config.bytesPerSecond);
                     if((this.config.bytesPerSecond*this.pendingBytesBufferExpandedFactor) > this.config.maxBufferSize){
@@ -247,8 +305,8 @@ class BandwidthThrottle extends BaseTransformStream {
                     } else {
                         this.pendingBytesBufferExpandedSize = this.config.bytesPerSecond*this.pendingBytesBufferExpandedFactor;
                     }
+                    console.log("Expanding buffer to " + this.pendingBytesBufferExpandedSize/1024/1024+" MB.");
                 }
-                console.log("Expanding buffer to " + this.pendingBytesBufferExpandedSize/1024/1024+" MB.");
                 await this.trim_buffer();
             } else {
                 console.log("maxBufferSize reached. Aborting request as output is too slow or maxBufferSize is too small.");
@@ -269,7 +327,7 @@ class BandwidthThrottle extends BaseTransformStream {
         // If no throttling is applied, avoid any initial latency by immediately
         // processing the queue on the next frame.
 
-        if (!this.config.isThrottled) this.process();
+        if (!this.config.isThrottled) this.process(undefined);
     }
 
     /**
@@ -300,4 +358,4 @@ class BandwidthThrottle extends BaseTransformStream {
     }
 }
 
-export default BandwidthThrottle;
+export default BandwidthThrottleWithBackpressure;

@@ -5,6 +5,7 @@ class Config implements IConfig {
     public ticksPerSecond: number = 40;
     public throughputSampleIntervalMs: number = 1000;
     public throughputSampleSize: number = 4;
+    public maxBufferSize: number = 1024 * 1024 * 10;
 
     public get isThrottled(): boolean {
         return this.bytesPerSecond < Infinity;
